@@ -1,0 +1,224 @@
+import os
+import subprocess
+import sys
+import importlib.util
+import re
+import atexit
+
+def install_module(module_name):
+    if importlib.util.find_spec(module_name) is None:
+        subprocess.check_call([sys.executable, "-m","pip", "install" , module_name])
+
+install_module("pandas")
+install_module("pyarrow")
+install_module("scikit-learn")
+install_module("nltk")
+install_module("beautifulsoup4")
+install_module("pyspellchecker")
+install_module("textblob")
+install_module("swifter")
+install_module("lxml")
+install_module("transformers")
+install_module("torch")
+install_module("llama-cpp-python")
+
+import torch
+import pandas as pd
+import numpy as np
+import pyarrow
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.feature_selection import SelectKBest,chi2
+from sklearn.decomposition import TruncatedSVD
+import nltk
+from nltk.corpus import wordnet
+from bs4 import BeautifulSoup
+from textblob import TextBlob
+from textblob import download_corpora
+from spellchecker import SpellChecker
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+import swifter
+from scipy.sparse import csr_matrix
+from joblib import Parallel, delayed
+from collections import Counter
+import random
+from bs4 import MarkupResemblesLocatorWarning
+import warnings
+import multiprocessing
+from llama_cpp import Llama
+multiprocessing.set_start_method("fork", force=True)
+
+warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+
+def load_local_llm(model_file="/Users/LLMs/llama-2-13b-chat.Q4_K_M.gguf"): #change as per your need
+    return Llama(
+        model_path=model_file,
+        n_ctx=2048,               # Good default. Increase if prompt is long.
+        seed=42,                  # For reproducibility
+        temperature=0.0,          # Lower = more deterministic
+        top_k=1,                  # Limits sampling to top k tokens
+        repeat_penalty=2.0,       # Prevents repetitive output
+        n_threads=6,              # Matches typical Mac M4 core count
+        n_gpu_layers=35,          # Balanced GPU offload for 13B on Mac M4
+        use_mlock=False,           # Lock model in RAM to avoid swapping
+        verbose=False             # Set to True for debugging
+    )
+
+def generate_with_llm(llm, incident_description): #, work_notes):
+    prompt = f"""[INST] You are a strict incident categorization engine.  
+    Given an incident description, output only the incident category in 1–3 words with a 'INCIDENT CATEGORY:' label. 
+    Do not give any greetings, confirmation, explanation. Here is incident description:
+    \n\n{incident_description}\n\n 
+    start your response here INCIDENT CATEGORY:""" + " [/INST]"
+
+    response = llm(
+        prompt,
+        #grammar = grammar, # specify grammar GBNF if required
+        max_tokens=0,
+        echo=False
+    )
+
+    text = response["choices"][0]["text"].strip()
+
+    return text 
+
+llm = load_local_llm()
+
+# **Load NLTK Resources Only Once**
+nltk.download("stopwords", quiet=True)
+nltk.download("wordnet", quiet=True)
+nltk.download('omw-1.4')
+
+# **Preload Stopwords and Lemmatizer**
+stop_words = set(stopwords.words("english"))
+lemmatizer = WordNetLemmatizer()
+
+# **Fast Dictionary-Based Spell Checker**
+spell = SpellChecker()
+
+# 1. Synonym Replacement (top-level, picklable)
+def synonym_replacement(text, n=5):
+    text = str(text)
+    words = text.split()
+    new_words = words.copy()
+    word_synset_map = {word: wordnet.synsets(word) for word in set(words)}
+    word_synset_map = {word: syns for word, syns in word_synset_map.items() if syns}
+    random_words = list(word_synset_map.keys())
+    random.shuffle(random_words)
+    num_replaced = 0
+    for word in random_words:
+        synonyms = word_synset_map[word]
+        if synonyms:
+            synonym = synonyms[0].lemmas()[0].name()
+            new_words = [synonym if w == word else w for w in new_words]
+            num_replaced += 1
+        if num_replaced >= n:
+            break
+    return ' '.join(new_words)
+
+# 2. Parallel wrapper using multiprocessing.Pool
+def parallel_augment(text_list, n=5, num_workers=4):
+    with multiprocessing.Pool(processes=num_workers) as pool:
+        return pool.starmap(synonym_replacement, [(text, n) for text in text_list])
+
+# 3. Full Auto-Balancer with Augmentation
+def auto_balance_with_augmentation(
+    df, 
+    text_col="Input", 
+    target_col="CATEGORY", 
+    min_class_proportion=0.5, 
+    augment_per_sample=50,
+    n_replacements=5,
+    num_workers=4
+):
+    class_counts = df[target_col].value_counts()
+    max_class_size = class_counts.max()
+    
+    print(f"\nClass distribution before augmentation:\n{class_counts}\n")
+    
+    augmented_rows = []
+
+    for category, count in class_counts.items():
+        if count < min_class_proportion * max_class_size:
+            target_size = int(min_class_proportion * max_class_size)
+            needed = target_size - count
+
+            print(f"Augmenting {needed} samples for class '{category}'...")
+
+            original_texts = df[df[target_col] == category][text_col].tolist()
+
+            if not original_texts:
+                continue
+
+            multiplier = (needed // len(original_texts)) + 1
+            texts_to_augment = (original_texts * multiplier)[:needed]
+
+            # Augment in parallel
+            augmented_texts = parallel_augment(
+                texts_to_augment,
+                n=n_replacements,
+                num_workers=num_workers
+            )
+
+            aug_df = pd.DataFrame({
+                text_col: augmented_texts,
+                target_col: [category] * len(augmented_texts)
+            })
+
+            augmented_rows.append(aug_df)
+
+    # Merge augmented data with original
+    if augmented_rows:
+        df_augmented = pd.concat([df] + augmented_rows, ignore_index=True)
+    else:
+        df_augmented = df.copy()
+
+    print(f"\nClass distribution after augmentation:\n{df_augmented[target_col].value_counts()}\n")
+    
+    return df_augmented
+
+# **Precompiled Regex for Faster Cleaning**
+cleaning_patterns = re.compile(
+    r"[^a-zA-Z0-9\s]"  # Remove special characters
+    r"|\b[A-Za-z]\d+\b"  # Remove IDs like 'A12345'
+    r"|\b\d+\b"  # Remove standalone numbers
+    r"|\S+@\S+"  # Remove emails
+    r"|http\S+"  # Remove URLs
+    r"|@\w+"  # Remove social media handles
+)
+
+# ** Super Optimized Text Cleaning Function **
+def clean_text_optimized(text):
+    if not isinstance(text, str):  # Skip non-string values
+        return ""
+
+    # Convert to lowercase
+    text = text.lower()
+
+    # Remove HTML and Apply Precompiled Regex
+    text = cleaning_patterns.sub("", BeautifulSoup(text, "lxml").get_text())
+
+    # **Batch Spell Checking (MUCH Faster)**
+    words = text.split()
+    #if len(words) > 50:  # Avoid processing long strings unnecessarily
+        #return text
+
+   #misspelled = spell.unknown(words)  # Find misspelled words in bulk
+    #if len(misspelled) > 0:
+        #corrections = {word: spell.correction(word) or word for word in misspelled}
+        #words = [corrections.get(word, word) for word in words]  # Apply corrections
+
+    # **Process Words in a Single Pass (Stopword Removal + Lemmatization)**
+    cleaned_words = [lemmatizer.lemmatize(word) for word in words]
+
+    return " ".join(cleaned_words)  # Return Cleaned Text
+
+# ** Super Fast Parallel Processing Using Swifter**
+def clean_dataframe(df, text_column): # parallalized cleaning
+    df[text_column] = df[text_column].swifter.apply(clean_text_optimized)
+    return df
