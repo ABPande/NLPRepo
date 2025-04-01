@@ -1,0 +1,116 @@
+# tokenizer_finetune_lib.py
+import os
+import subprocess
+import sys
+import importlib.util
+import re
+
+def install_module(module_name):
+    if importlib.util.find_spec(module_name) is None:
+        subprocess.check_call([sys.executable, "-m","pip", "install" , module_name])
+
+install_module("pydantic")
+install_module("transformers")
+install_module("accelerate")
+install_module("tiktoken")
+install_module("einops")
+install_module("datasets")
+install_module("peft")
+install_module("accelerate")
+install_module("bitsandbytes")
+
+import json
+from typing import Callable, List, Dict
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling
+from datasets import load_dataset, Dataset
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+# --------------------------------------
+# 1. Load Dataset
+# --------------------------------------
+def load_jsonl_dataset(path: str) -> Dataset:
+    return load_dataset("json", data_files={"train": path})["train"]
+
+# --------------------------------------
+# 2. Format Dataset
+# --------------------------------------
+def format_instruction(example: Dict[str, str], format_fn: Callable[[Dict[str, str]], str]) -> Dict[str, str]:
+    example["formatted"] = format_fn(example)
+    return example
+
+def apply_formatting(dataset: Dataset, format_fn: Callable[[Dict[str, str]], str]) -> Dataset:
+    return dataset.map(lambda x: format_instruction(x, format_fn))
+
+# --------------------------------------
+# 3. Tokenize
+# --------------------------------------
+def tokenize_formatted(example: Dict[str, str], tokenizer, max_length=512) -> Dict:
+    return tokenizer(example["formatted"], truncation=True, padding="max_length", max_length=max_length)
+
+def tokenize_dataset(dataset: Dataset, tokenizer, max_length=512) -> Dataset:
+    return dataset.map(lambda x: tokenize_formatted(x, tokenizer, max_length), batched=True)
+
+# --------------------------------------
+# 4. Load Model
+# --------------------------------------
+def load_model(model_id: str, use_peft=True, target_modules=["q_proj", "v_proj"], lora_r=8, lora_alpha=16):
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto", trust_remote_code=True)
+
+    if use_peft:
+        model = prepare_model_for_kbit_training(model)
+        config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        model = get_peft_model(model, config)
+
+    return model, tokenizer
+
+# --------------------------------------
+# 5. Fine-tune Model
+# --------------------------------------
+def train_model(model, tokenizer, dataset: Dataset, output_dir: str, batch_size=4, epochs=3, lr=2e-5):
+    args = TrainingArguments(
+        output_dir=output_dir,
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=4,
+        num_train_epochs=epochs,
+        save_strategy="epoch",
+        learning_rate=lr,
+        bf16=False,
+        fp16=True,
+        logging_dir="./logs",
+        report_to="none"
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=dataset,
+        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False)
+    )
+
+    trainer.train()
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+
+# --------------------------------------
+# 6. Sample Format Function
+# --------------------------------------
+def default_format_fn(example: Dict[str, str]) -> str:
+    return f"""### Instruction:\n{example['instruction']}\n\n### Input:\n{example['input']}\n\n### Response:\n{example['output']}"""
+
+# --------------------------------------
+# Example Usage (to be called externally)
+# --------------------------------------
+# from tokenizer_finetune_lib import *
+# dataset = load_jsonl_dataset("train.jsonl")
+# dataset = apply_formatting(dataset, default_format_fn)
+# model, tokenizer = load_model("meta-llama/Meta-Llama-3-7B-Instruct")
+# tokenized = tokenize_dataset(dataset, tokenizer)
+# train_model(model, tokenizer, tokenized, output_dir="llama-finetuned")
